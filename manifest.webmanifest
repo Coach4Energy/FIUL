@@ -1,0 +1,10 @@
+{
+  "name": "FIUL · Coach4Energy",
+  "short_name": "FIUL",
+  "start_url": "/#/hoy",
+  "display": "standalone",
+  "background_color": "#0f1720",
+  "theme_color": "#0f1720",
+  "lang": "es-AR",
+  "icons": [{ "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }]
+}
