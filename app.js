@@ -100,15 +100,16 @@
 
   /* ---------- navegación ---------- */
   function ruta() {
-    const h = location.hash.replace(/^#\/?/, "");
+    const h = location.hash.replace(/^#\/?/, "").split("?")[0];
     const p = h.split("/").filter(Boolean);
-    return { vista: p[0] || "", id: p[1] ? Number(p[1]) : null };
+    return { vista: p[0] || "", id: p[1] && /^\d+$/.test(p[1]) ? Number(p[1]) : null, raw: p };
   }
   function pintarNav(vista, clienteId) {
     TOP.hidden = false;
     const links = [];
     const suf = estado.esCoach && clienteId ? "/" + clienteId : "";
     if (estado.esCoach) links.push(["coach", "Clientes", "#/coach"]);
+    if (estado.esCoach && clienteId) links.push(["ficha", "Ficha", "#/ficha/" + clienteId]);
     if (!estado.esCoach || clienteId) {
       links.push(["hoy", "Hoy", "#/hoy" + suf], ["plan", "Mi plan", "#/plan" + suf], ["informe", "Informe", "#/informe" + suf]);
     }
@@ -118,13 +119,25 @@
   async function render() {
     if (!conf()) { TOP.hidden = true; APP.innerHTML = `<div class="form"><h2>Falta configurar</h2><p class="lede">Pegá la publishable key de Supabase en <span class="mono">config.js</span>.</p></div>`; return; }
     if (!sesion) { TOP.hidden = true; return vistaLogin(); }
+    const hashInicial = location.hash;
     try {
       if (!estado.clientes) await cargarBase();
       const { vista, id } = ruta();
       if (!estado.esCoach && estado.cliente && !estado.cliente.consentimiento_at) { TOP.hidden = true; return vistaConsentimiento(); }
       if (estado.esCoach) {
         if (!vista || vista === "coach") { pintarNav("coach"); return vistaCoach(); }
+        if (vista === "ficha" && ruta().raw[1] === "nuevo") { pintarNav("coach"); return vistaFichaForm(null); }
         if (!id) { location.hash = "#/coach"; return; }
+        if (["ficha", "editar-ficha", "medicion", "editar-plan"].includes(vista)) {
+          const c = estado.clientes.find((x) => x.id === id);
+          if (!c) { APP.innerHTML = `<p class="err">No se encontró ese cliente.</p>`; return; }
+          pintarNav("ficha", id);
+          APP.innerHTML = `<p class="muted">Cargando…</p>`;
+          if (vista === "ficha") return await vistaFicha(c);
+          if (vista === "editar-ficha") return vistaFichaForm(c);
+          if (vista === "medicion") return await vistaMedicionForm(c, ruta().raw[2] ? Number(ruta().raw[2]) : null);
+          if (vista === "editar-plan") return await vistaPlanForm(c);
+        }
       } else if (!estado.cliente) {
         TOP.hidden = false; NAV.innerHTML = "";
         APP.innerHTML = `<section class="card"><h2>Tu cuenta todavía no tiene una ficha</h2><p class="lede">Avisale a Juanba: tu ficha tiene que estar cargada con el mismo email con el que entraste (${esc(sesion.user.email)}).</p></section>`;
@@ -142,6 +155,9 @@
       console.error(e);
       APP.innerHTML = `<section class="card"><h2>No se pudo cargar</h2><p class="err">${esc(e.message)}</p><button class="btn sec" type="button" id="retry">Reintentar</button></section>`;
       document.getElementById("retry").addEventListener("click", () => location.reload());
+    } finally {
+      // Si el usuario cambió de pantalla mientras esta cargaba, se vuelve a dibujar la actual.
+      if (location.hash !== hashInicial) setTimeout(render, 0);
     }
   }
   window.addEventListener("hashchange", render);
@@ -484,14 +500,322 @@
             <td class="num">${f.ultimo ? esc(fechaCorta(f.ultimo)) : "–"}</td>
             <td>${f.c.consentimiento_at ? '<span class="pill good">Aceptado</span>' : '<span class="pill warn">Pendiente</span>'}</td></tr>`).join("")
         }</tbody></table></div>` : `<p class="lede">Todavía no hay clientes cargados.</p>`}
-        <p class="small muted">Para ver el plan, el registro o el informe de un cliente, tocá su fila.</p>
+        <div class="row-actions"><a class="btn" href="#/ficha/nuevo">+ Nuevo cliente</a><span class="small muted">Tocá una fila para ver la ficha, cargar mediciones o editar el plan.</span></div>
       </section>`;
     APP.querySelectorAll("tr.link").forEach((tr) => {
-      const go = () => (location.hash = "#/hoy/" + tr.dataset.id);
+      const go = () => (location.hash = "#/ficha/" + tr.dataset.id);
       tr.addEventListener("click", go);
       tr.addEventListener("keydown", (e) => { if (e.key === "Enter") go(); });
     });
   }
+
+  /* =====================================================================
+     ETAPA 3 · Herramientas del coach: ficha, mediciones y editor de plan
+     ===================================================================== */
+  const val = (id) => document.getElementById(id)?.value?.trim() ?? "";
+  const numOrNull = (v) => { if (v === "" || v == null) return null; const n = Number(String(v).replace(",", ".")); return isNaN(n) ? null : n; };
+  const opt = (v, actual, txt) => `<option value="${esc(v)}" ${String(v) === String(actual ?? "") ? "selected" : ""}>${esc(txt ?? v)}</option>`;
+  async function recargarClientes() { const uid = sesion.user.id; estado.clientes = await api("clientes?select=*&order=nombre.asc"); estado.cliente = estado.clientes.find((c) => c.user_id === uid) || null; }
+  function avisar(id, txt, ok) { const e = document.getElementById(id); if (e) { e.textContent = txt; e.className = ok ? "status ok" : "err"; } }
+  const diaAnterior = (iso) => { const d = new Date(iso + "T12:00:00"); d.setDate(d.getDate() - 1); return d.toISOString().slice(0, 10); };
+  const fechaAR = (iso) => (iso ? iso.split("-").reverse().join("/") : "–");
+
+  /* ---------- Ficha del cliente ---------- */
+  async function vistaFicha(c) {
+    const [planes, meds, regs] = await Promise.all([
+      api(`planes?select=id,nombre,activo,vigente_desde,vigente_hasta,kcal_objetivo,proteina_objetivo_g&cliente_id=eq.${c.id}&order=id.desc`),
+      api(`mediciones?select=id,numero,fecha,peso_kg,masa_muscular_kg,masa_adiposa_kg&cliente_id=eq.${c.id}&order=numero.desc`),
+      api(`registros_diarios?select=fecha&cliente_id=eq.${c.id}&order=fecha.desc&limit=1`),
+    ]);
+    const activo = planes.find((p) => p.activo);
+    APP.innerHTML = `
+      <div class="head"><div class="eyebrow">Ficha del cliente</div><h1>${esc(c.nombre)}</h1>
+        <p class="lede">${esc(c.email)} · ${esc(c.servicio || "sin servicio")} · alta ${fechaAR(c.fecha_alta)}</p></div>
+      <div class="kpis">
+        <div class="kpi"><div class="eyebrow">Cuenta</div><div class="v" style="font-size:24px">${c.user_id ? "Vinculada" : "Sin usuario"}</div><div class="d">${c.user_id ? "puede entrar a la app" : "crear el usuario en Supabase"}</div></div>
+        <div class="kpi"><div class="eyebrow">Consentimiento</div><div class="v" style="font-size:24px">${c.consentimiento_at ? "Aceptado" : "Pendiente"}</div><div class="d">${c.consentimiento_at ? fechaAR(c.consentimiento_at.slice(0, 10)) : "lo acepta al primer ingreso"}</div></div>
+        <div class="kpi"><div class="eyebrow">Mediciones</div><div class="v">${meds.length}</div><div class="d">${meds[0] ? "última " + fechaAR(meds[0].fecha) : "ninguna"}</div></div>
+        <div class="kpi"><div class="eyebrow">Último registro</div><div class="v" style="font-size:24px">${regs[0] ? esc(fechaCorta(regs[0].fecha)) : "–"}</div><div class="d">${c.activo ? "cliente activo" : "cliente inactivo"}</div></div>
+      </div>
+      ${!c.user_id ? `<div class="callout">Para que ${esc(c.nombre.split(" ")[0])} pueda entrar: Supabase → Authentication → Users → Add user → email <b>${esc(c.email)}</b>, una contraseña y "Auto Confirm User". Se vincula solo.</div>` : ""}
+      <section class="card">
+        <div class="who"><div class="head"><div class="eyebrow">Datos</div><h2>Objetivo y fase</h2></div><a class="btn sec" href="#/editar-ficha/${c.id}">Editar ficha</a></div>
+        <div class="grid2"><div class="box"><b>Objetivo</b><span>${esc(c.objetivo || "Sin cargar")}</span></div><div class="box"><b>Fase actual</b><span>${esc(c.fase_actual || "Sin cargar")}</span></div></div>
+      </section>
+      <section class="card">
+        <div class="who"><div class="head"><div class="eyebrow">Plan</div><h2>${activo ? esc(activo.nombre) : "Sin plan activo"}</h2></div><a class="btn" href="#/editar-plan/${c.id}">${activo ? "Editar plan" : "Crear plan"}</a></div>
+        ${planes.length ? `<div class="tbl"><table><thead><tr><th>Plan</th><th>Vigencia</th><th>kcal</th><th>Proteína</th><th>Estado</th></tr></thead><tbody>${planes.map((p) => `<tr><td class="wrap-cell">${esc(p.nombre)}</td><td class="num">${fechaAR(p.vigente_desde)} → ${fechaAR(p.vigente_hasta)}</td><td class="num">${p.kcal_objetivo}</td><td class="num">${p.proteina_objetivo_g} g</td><td>${p.activo ? '<span class="pill good">Activo</span>' : '<span class="pill">Anterior</span>'}</td></tr>`).join("")}</tbody></table></div>` : ""}
+      </section>
+      <section class="card">
+        <div class="who"><div class="head"><div class="eyebrow">Antropometría</div><h2>Mediciones</h2></div><a class="btn" href="#/medicion/${c.id}">+ Cargar medición</a></div>
+        ${meds.length ? `<div class="tbl"><table><thead><tr><th>#</th><th>Fecha</th><th>Peso</th><th>Muscular</th><th>Adiposa</th><th></th></tr></thead><tbody>${meds.map((m) => `<tr><td class="num">#${m.numero}</td><td class="num">${fechaAR(m.fecha)}</td><td class="num">${fmt(+m.peso_kg)} kg</td><td class="num">${fmt(+m.masa_muscular_kg)} kg</td><td class="num">${fmt(+m.masa_adiposa_kg)} kg</td><td><a href="#/medicion/${c.id}/${m.id}">Editar</a></td></tr>`).join("")}</tbody></table></div>` : `<p class="muted">Todavía no hay mediciones.</p>`}
+      </section>
+      <section class="card"><div class="head"><div class="eyebrow">Vista del cliente</div><h2>Ver la app como ${esc(c.nombre.split(" ")[0])}</h2></div>
+        <div class="row-actions"><a class="btn sec" href="#/hoy/${c.id}">Hoy</a><a class="btn sec" href="#/plan/${c.id}">Plan</a><a class="btn sec" href="#/informe/${c.id}">Informe</a></div></section>`;
+  }
+
+  /* ---------- Alta / edición de ficha ---------- */
+  function vistaFichaForm(c) {
+    const nuevo = !c; c = c || { activo: true, fecha_alta: hoyISO(), servicio: "Energy Masterplan" };
+    APP.innerHTML = `
+      <div class="head"><div class="eyebrow">${nuevo ? "Nuevo cliente" : "Editar ficha"}</div><h1>${nuevo ? "Alta de cliente" : esc(c.nombre)}</h1></div>
+      <form class="card" id="f-ficha" novalidate>
+        <div class="fgrid">
+          <label class="f">Nombre y apellido<input id="ff-nombre" required value="${esc(c.nombre)}"></label>
+          <label class="f">Email (con el que va a entrar)<input type="email" id="ff-email" required value="${esc(c.email)}"></label>
+          <label class="f">Servicio<select id="ff-serv">${["Energy Masterplan", "Progressive Plan", "Piloto"].map((s) => opt(s, c.servicio)).join("")}</select></label>
+          <label class="f">Fecha de alta<input type="date" id="ff-alta" value="${esc(c.fecha_alta)}"></label>
+        </div>
+        <label class="f">Objetivo<textarea id="ff-obj" rows="2">${esc(c.objetivo)}</textarea></label>
+        <label class="f">Fase actual<input id="ff-fase" value="${esc(c.fase_actual)}" placeholder="ej. Déficit oct–dic 2026"></label>
+        <label class="check"><input type="checkbox" id="ff-activo" ${c.activo ? "checked" : ""}><span>Cliente activo</span></label>
+        <div class="row-actions"><button class="btn" type="submit" id="ff-btn">${nuevo ? "Crear cliente" : "Guardar cambios"}</button><a class="linkbtn" href="${nuevo ? "#/coach" : "#/ficha/" + c.id}">Cancelar</a><span id="ff-msg" role="status"></span></div>
+      </form>`;
+    document.getElementById("f-ficha").addEventListener("submit", async (ev) => {
+      ev.preventDefault();
+      const body = { nombre: val("ff-nombre"), email: val("ff-email").toLowerCase(), servicio: val("ff-serv"), fecha_alta: val("ff-alta") || hoyISO(),
+        objetivo: val("ff-obj") || null, fase_actual: val("ff-fase") || null, activo: document.getElementById("ff-activo").checked };
+      if (!body.nombre || !/^\S+@\S+\.\S+$/.test(body.email)) return avisar("ff-msg", "Completá el nombre y un email válido.");
+      const btn = document.getElementById("ff-btn"); btn.disabled = true;
+      try {
+        let id = c.id;
+        if (nuevo) { const r = await api("clientes", { method: "POST", body, prefer: "return=representation" }); id = r[0].id; }
+        else await api(`clientes?id=eq.${c.id}`, { method: "PATCH", body, prefer: "return=minimal" });
+        await recargarClientes(); location.hash = "#/ficha/" + id;
+      } catch (e) {
+        btn.disabled = false;
+        avisar("ff-msg", /duplicate|unique|23505/i.test(e.message) ? "Ya existe un cliente con ese email." : "No se pudo guardar: " + e.message);
+      }
+    });
+  }
+
+  /* ---------- Medición ISAK ---------- */
+  const PLIEGUES = [["triceps", "Tríceps"], ["subescapular", "Subescapular"], ["supraespinal", "Supraespinal"], ["abdominal", "Abdominal"], ["muslo_medio", "Muslo medio"], ["pantorrilla", "Pantorrilla"]];
+  const PERIMETROS = [["brazo_relajado", "Brazo relajado"], ["brazo_flexionado", "Brazo flexionado"], ["antebrazo", "Antebrazo"], ["torax", "Tórax mesoesternal"], ["cintura", "Cintura mínima"], ["cadera", "Cadera máxima"], ["muslo_maximo", "Muslo máximo"], ["muslo_medio", "Muslo medio"], ["pantorrilla", "Pantorrilla"]];
+  const MASAS = [["masa_muscular_kg", "Muscular"], ["masa_adiposa_kg", "Adiposa"], ["masa_residual_kg", "Residual"], ["masa_osea_kg", "Ósea"], ["masa_piel_kg", "Piel"]];
+  async function vistaMedicionForm(c, medId) {
+    const meds = await api(`mediciones?select=*&cliente_id=eq.${c.id}&order=numero.desc`);
+    const m = medId ? meds.find((x) => x.id === medId) : null;
+    if (medId && !m) { APP.innerHTML = `<p class="err">No se encontró esa medición.</p>`; return; }
+    const prev = meds.find((x) => !m || x.numero < m.numero);
+    const d = m || { numero: (meds[0]?.numero || 0) + 1, fecha: hoyISO(), talla_cm: prev?.talla_cm, pliegues_mm: {}, perimetros_cm: {} };
+    const inp = (id, v, ph) => `<input inputmode="decimal" id="${id}" value="${v == null ? "" : esc(v)}" placeholder="${esc(ph ?? "")}">`;
+    APP.innerHTML = `
+      <div class="head"><div class="eyebrow">${esc(c.nombre)} · ${m ? "editar medición" : "nueva medición"}</div><h1>Medición #${d.numero}</h1>
+        <p class="lede">Cargá los valores de tu planilla ISAK. Entre paréntesis, la medición anterior${prev ? ` (#${prev.numero}, ${fechaAR(prev.fecha)})` : ""}.</p></div>
+      <form class="card" id="f-med" novalidate>
+        <div class="fgrid">
+          <label class="f">Número<input inputmode="numeric" id="fm-num" value="${d.numero}"></label>
+          <label class="f">Fecha<input type="date" id="fm-fecha" value="${esc(d.fecha)}"></label>
+          <label class="f">Peso (kg) ${prev ? `<span class="muted">(${fmt(+prev.peso_kg)})</span>` : ""}${inp("fm-peso", d.peso_kg)}</label>
+          <label class="f">Talla (cm)${inp("fm-talla", d.talla_cm)}</label>
+        </div>
+        <h3>Fraccionamiento en 5 masas (kg)</h3>
+        <div class="fgrid">${MASAS.map(([k, n]) => `<label class="f">${n} ${prev ? `<span class="muted">(${fmt(+prev[k])})</span>` : ""}${inp("fm-" + k, d[k])}</label>`).join("")}</div>
+        <p class="small" id="fm-check" role="status"></p>
+        <h3>Pliegues (mm)</h3>
+        <div class="fgrid">${PLIEGUES.map(([k, n]) => `<label class="f">${n} ${prev?.pliegues_mm?.[k] != null ? `<span class="muted">(${fmt(+prev.pliegues_mm[k])})</span>` : ""}${inp("fp-" + k, d.pliegues_mm?.[k])}</label>`).join("")}</div>
+        <h3>Perímetros (cm)</h3>
+        <div class="fgrid">${PERIMETROS.map(([k, n]) => `<label class="f">${n} ${prev?.perimetros_cm?.[k] != null ? `<span class="muted">(${fmt(+prev.perimetros_cm[k])})</span>` : ""}${inp("fr-" + k, d.perimetros_cm?.[k])}</label>`).join("")}</div>
+        <label class="f">Notas<textarea id="fm-notas" rows="2">${esc(d.notas)}</textarea></label>
+        <div class="row-actions"><button class="btn" type="submit" id="fm-btn">Guardar medición</button><a class="linkbtn" href="#/ficha/${c.id}">Cancelar</a><span id="fm-msg" role="status"></span></div>
+      </form>`;
+    const chequear = () => {
+      const peso = numOrNull(val("fm-peso")); const suma = MASAS.reduce((a, [k]) => a + (numOrNull(val("fm-" + k)) || 0), 0);
+      const el = document.getElementById("fm-check");
+      if (!peso || !suma) { el.textContent = ""; return; }
+      const dif = ((suma - peso) / peso) * 100;
+      el.innerHTML = `Peso estructurado ${fmt(suma)} kg contra peso bruto ${fmt(peso)} kg: diferencia ${fmt(dif, 2)} % ${Math.abs(dif) < 5 ? '<span class="pill good">dentro del margen ISAK (&lt; 5 %)</span>' : '<span class="pill crit">revisar: supera el 5 %</span>'}`;
+    };
+    document.getElementById("f-med").addEventListener("input", chequear); chequear();
+    document.getElementById("f-med").addEventListener("submit", async (ev) => {
+      ev.preventDefault();
+      const pl = {}, pe = {};
+      PLIEGUES.forEach(([k]) => { const v = numOrNull(val("fp-" + k)); if (v != null) pl[k] = v; });
+      PERIMETROS.forEach(([k]) => { const v = numOrNull(val("fr-" + k)); if (v != null) pe[k] = v; });
+      const body = { cliente_id: c.id, numero: numOrNull(val("fm-num")), fecha: val("fm-fecha"), peso_kg: numOrNull(val("fm-peso")), talla_cm: numOrNull(val("fm-talla")),
+        pliegues_mm: pl, perimetros_cm: pe, notas: val("fm-notas") || null };
+      MASAS.forEach(([k]) => (body[k] = numOrNull(val("fm-" + k))));
+      if (!body.numero || !body.fecha || !body.peso_kg) return avisar("fm-msg", "Faltan el número, la fecha o el peso.");
+      const btn = document.getElementById("fm-btn"); btn.disabled = true;
+      try {
+        if (m) await api(`mediciones?id=eq.${m.id}`, { method: "PATCH", body, prefer: "return=minimal" });
+        else await api("mediciones", { method: "POST", body, prefer: "return=minimal" });
+        location.hash = "#/ficha/" + c.id;
+      } catch (e) {
+        btn.disabled = false;
+        avisar("fm-msg", /duplicate|unique|23505/i.test(e.message) ? `Ya existe una medición #${body.numero} para este cliente.` : "No se pudo guardar: " + e.message);
+      }
+    });
+  }
+
+  /* ---------- Editor de plan ---------- */
+  // Tabla editable genérica: columnas [{k, label, type:'text'|'num'|'select', options, w}]
+  function tablaEditable(host, cols, filas, nombreFila) {
+    const dibujar = () => {
+      host.innerHTML = `<div class="tbl"><table class="edit"><thead><tr>${cols.map((c) => `<th style="${c.w ? "width:" + c.w : ""}">${esc(c.label)}</th>`).join("")}<th></th></tr></thead><tbody>${
+        filas.map((f, i) => `<tr>${cols.map((c) => `<td>${c.type === "select"
+          ? `<select data-i="${i}" data-k="${c.k}">${c.options.map(([v, t]) => opt(v, f[c.k], t)).join("")}</select>`
+          : `<input data-i="${i}" data-k="${c.k}" ${c.type === "num" ? 'inputmode="decimal"' : ""} value="${f[c.k] == null ? "" : esc(f[c.k])}">`}</td>`).join("")}
+          <td><button type="button" class="linkbtn" data-del="${i}" aria-label="Quitar fila">Quitar</button></td></tr>`).join("")}</tbody></table></div>
+        <button type="button" class="btn sec small-btn" data-add>+ Agregar ${esc(nombreFila)}</button>`;
+    };
+    host.addEventListener("input", (e) => { const t = e.target; if (t.dataset.k == null) return; const col = cols.find((c) => c.k === t.dataset.k); filas[t.dataset.i][t.dataset.k] = col.type === "num" ? numOrNull(t.value) : t.value; });
+    host.addEventListener("change", (e) => { const t = e.target; if (t.tagName === "SELECT") filas[t.dataset.i][t.dataset.k] = t.value; });
+    host.addEventListener("click", (e) => {
+      if (e.target.dataset.del != null) { filas.splice(Number(e.target.dataset.del), 1); dibujar(); }
+      if (e.target.hasAttribute("data-add")) { filas.push(Object.fromEntries(cols.map((c) => [c.k, c.type === "select" ? c.options[0][0] : c.type === "num" ? null : ""]))); dibujar(); }
+    });
+    dibujar();
+    return () => filas.filter((f) => cols.some((c) => c.type !== "select" && f[c.k] !== "" && f[c.k] != null));
+  }
+  const DIAS_LARGOS = [[1, "Lu"], [2, "Ma"], [3, "Mi"], [4, "Ju"], [5, "Vi"], [6, "Sá"], [0, "Do"]];
+  const PLAN_BASE = {
+    nombre: "Plan por bloques", kcal_objetivo: 2200, proteina_objetivo_g: 160, carbohidratos_objetivo_g: 220, grasas_objetivo_g: 70,
+    vigente_desde: null, vigente_hasta: null,
+    tipos_dia: [{ id: "base", nombre: "Todos los días", dias: [0, 1, 2, 3, 4, 5, 6], comidas: [
+      { hora: "08:00", titulo: "Desayuno + creatina", detalle: "", p: 1, h: 2 }, { hora: "13:00", titulo: "Almuerzo", detalle: "", p: 2, h: 2 },
+      { hora: "17:00", titulo: "Merienda", detalle: "", p: 1, h: 1 }, { hora: "21:00", titulo: "Cena", detalle: "", p: 2, h: 2 }] }],
+    bloques: { contador: { metas: { p: 6, h: 7, o: 2 }, etiquetas: { p: "Bloques de proteína (25 g)", h: "Porciones de hidratos (~25 g)", o: "Cucharadas de aceite (15 g)" },
+      botones: [{ grupo: "Proteína (1 bloque)", clave: "p", items: [] }, { grupo: "Hidratos (1 porción)", clave: "h", items: [] }, { grupo: "Grasas", clave: "o", items: [{ n: "1 cda. aceite", q: 1 }, { n: "½ cda. aceite", q: 0.5 }] }] } },
+  };
+
+  async function vistaPlanForm(c) {
+    const [mio, otros] = await Promise.all([
+      planActivo(c.id),
+      api(`planes?select=id,cliente_id,nombre&activo=is.true&cliente_id=neq.${c.id}`),
+    ]);
+    let base = mio || null;
+    const plantillaId = new URLSearchParams(location.hash.split("?")[1] || "").get("desde");
+    if (!mio && plantillaId) base = (await api(`planes?select=*&id=eq.${Number(plantillaId)}`))[0] || null;
+    const P = JSON.parse(JSON.stringify(base || PLAN_BASE));
+    if (!mio) P.vigente_hasta = null;
+    const B = P.bloques = P.bloques || {};
+    B.contador = B.contador || JSON.parse(JSON.stringify(PLAN_BASE.bloques.contador));
+    const tipos = P.tipos_dia = (P.tipos_dia && P.tipos_dia.length ? P.tipos_dia : JSON.parse(JSON.stringify(PLAN_BASE.tipos_dia)));
+    const nombreCliente = (id) => esc(estado.clientes.find((x) => x.id === id)?.nombre || "cliente");
+    const lineas = (clave) => (B.contador.botones.find((g) => g.clave === clave)?.items || []).map((it) => (clave === "o" ? `${it.n} = ${it.q ?? 1}` : it.n)).join("\n");
+
+    APP.innerHTML = `
+      <div class="head"><div class="eyebrow">${esc(c.nombre)} · ${mio ? "editar plan activo" : "nuevo plan"}</div><h1>${mio ? "Editar plan" : "Crear plan"}</h1>
+        ${!mio ? `<p class="lede">${base ? `Partís de una copia del plan de <b>${nombreCliente(base.cliente_id)}</b>.` : "Partís de una plantilla básica."}
+          ${otros.length ? `Usar como base el plan de: <select id="fp-plantilla"><option value="">elegir…</option>${otros.map((o) => `<option value="${o.id}">${nombreCliente(o.cliente_id)} · ${esc(o.nombre)}</option>`).join("")}</select>` : ""}</p>` : ""}</div>
+      <form id="f-plan" novalidate style="display:flex;flex-direction:column;gap:20px">
+        <section class="card"><div class="head"><div class="eyebrow">1 · Encabezado</div><h2>Nombre y vigencia</h2></div>
+          <div class="fgrid">
+            <label class="f">Nombre del plan<input id="pp-nombre" value="${esc(P.nombre)}"></label>
+            <label class="f">Fase (texto chico arriba)<input id="pp-fase" value="${esc(B.fase)}"></label>
+            <label class="f">Vigente desde<input type="date" id="pp-desde" value="${esc(mio ? P.vigente_desde : hoyISO())}"></label>
+            <label class="f">Vigente hasta<input type="date" id="pp-hasta" value="${esc(P.vigente_hasta)}"></label>
+            <label class="f">Título<input id="pp-titulo" value="${esc(B.titulo)}" placeholder="ej. Bajar a 105 kg"></label>
+            <label class="f">Título destacado (en azul)<input id="pp-dest" value="${esc(B.titulo_destacado)}" placeholder="ej. sin soltar músculo."></label>
+          </div>
+          <label class="f">Bajada<textarea id="pp-bajada" rows="2">${esc(B.bajada)}</textarea></label></section>
+        <section class="card"><div class="head"><div class="eyebrow">2 · Objetivos</div><h2>Metas diarias</h2></div>
+          <div class="fgrid">
+            ${[["kcal_objetivo", "Calorías (kcal)", "kcal"], ["proteina_objetivo_g", "Proteína (g)", "proteina"], ["carbohidratos_objetivo_g", "Hidratos (g)", "hidratos"], ["grasas_objetivo_g", "Grasas (g)", "grasas"]]
+              .map(([k, n, nk]) => `<label class="f">${n}<input inputmode="numeric" id="pp-${k}" value="${P[k] ?? ""}"></label><label class="f">Nota (${n.split(" ")[0].toLowerCase()})<input id="pn-${nk}" value="${esc(B.notas_metas?.[nk])}"></label>`).join("")}
+          </div>
+          <h3>Metas del contador</h3>
+          <div class="fgrid">
+            <label class="f">Bloques de proteína / día<input inputmode="decimal" id="pc-p" value="${B.contador.metas.p}"></label>
+            <label class="f">Porciones de hidratos / día<input inputmode="decimal" id="pc-h" value="${B.contador.metas.h}"></label>
+            <label class="f">Cucharadas de aceite / día<input inputmode="decimal" id="pc-o" value="${B.contador.metas.o}"></label>
+          </div></section>
+        <section class="card"><div class="head"><div class="eyebrow">3 · Estructura</div><h2>Tipos de día y comidas</h2><p class="lede">P = bloques de proteína, H = porciones de hidratos de esa comida. La app elige sola el tipo de día según el día de la semana.</p></div>
+          <div id="pp-tipos"></div><button type="button" class="btn sec" id="pp-add-tipo">+ Agregar tipo de día</button></section>
+        <section class="card"><div class="head"><div class="eyebrow">4 · Contador</div><h2>Botones para sumar</h2><p class="lede">Un botón por línea. En grasas, la cantidad va después de "=" (ej. "½ cda. aceite = 0.5").</p></div>
+          <div class="grid3">
+            <label class="f">Proteína (1 bloque cada uno)<textarea id="pb-p" rows="8">${esc(lineas("p"))}</textarea></label>
+            <label class="f">Hidratos (1 porción cada uno)<textarea id="pb-h" rows="8">${esc(lineas("h"))}</textarea></label>
+            <label class="f">Grasas<textarea id="pb-o" rows="8">${esc(lineas("o"))}</textarea></label>
+          </div></section>
+        <section class="card"><div class="head"><div class="eyebrow">5 · Intercambios</div><h2>Qué cuenta como un bloque de proteína</h2></div>
+          <label class="f">Nota arriba de la tabla<input id="pp-notaint" value="${esc(B.nota_intercambios)}"></label><div id="pp-int"></div></section>
+        <section class="card"><div class="head"><div class="eyebrow">6 · Hidratos</div><h2>Qué cuenta como una porción</h2></div><div id="pp-hc"></div></section>
+        <section class="card"><div class="head"><div class="eyebrow">7 · Textos</div><h2>Grasas, verduras, finde y otros</h2></div><div id="pp-textos"></div></section>
+        <section class="card"><div class="head"><div class="eyebrow">8 · Reglas</div><h2>Reglas de la fase</h2></div><div id="pp-reglas"></div>
+          <label class="f">Pie del plan<textarea id="pp-pie" rows="2">${esc(B.pie)}</textarea></label></section>
+        <div class="card sticky-save"><div class="row-actions">
+          ${mio ? '<button class="btn" type="submit" data-modo="editar">Guardar cambios</button><button class="btn sec" type="submit" data-modo="nuevo">Guardar como plan nuevo</button>' : '<button class="btn" type="submit" data-modo="nuevo">Crear plan</button>'}
+          <a class="linkbtn" href="#/ficha/${c.id}">Cancelar</a><span id="pp-msg" role="status"></span></div>
+          ${mio ? '<p class="small muted">"Guardar cambios" corrige el plan actual. "Guardar como plan nuevo" deja el actual como anterior (queda el historial) y activa este.</p>' : ""}</div>
+      </form>`;
+
+    const sel = document.getElementById("fp-plantilla");
+    if (sel) sel.addEventListener("change", () => { if (sel.value) { location.hash = `#/editar-plan/${c.id}?desde=${sel.value}`; } });
+
+    // tipos de día
+    const hostTipos = document.getElementById("pp-tipos");
+    const getComidas = [];
+    function dibujarTipos() {
+      getComidas.length = 0;
+      hostTipos.innerHTML = tipos.map((t, i) => `<div class="tipo" data-t="${i}">
+        <div class="fgrid"><label class="f">Nombre del tipo de día<input data-tn="${i}" value="${esc(t.nombre)}"></label>
+          <div class="f">Días<div class="dias">${DIAS_LARGOS.map(([d, n]) => `<label class="dia"><input type="checkbox" data-td="${i}" value="${d}" ${(t.dias || []).includes(d) ? "checked" : ""}>${n}</label>`).join("")}</div></div></div>
+        <div data-comidas="${i}"></div>
+        ${tipos.length > 1 ? `<button type="button" class="linkbtn" data-tdel="${i}">Quitar este tipo de día</button>` : ""}</div>`).join("");
+      tipos.forEach((t, i) => getComidas.push(tablaEditable(hostTipos.querySelector(`[data-comidas="${i}"]`),
+        [{ k: "hora", label: "Hora", w: "80px" }, { k: "titulo", label: "Comida", w: "22%" }, { k: "detalle", label: "Detalle" }, { k: "p", label: "P", type: "num", w: "56px" }, { k: "h", label: "H", type: "num", w: "56px" }],
+        t.comidas, "comida")));
+    }
+    hostTipos.addEventListener("input", (e) => { if (e.target.dataset.tn != null) tipos[e.target.dataset.tn].nombre = e.target.value; });
+    hostTipos.addEventListener("change", (e) => {
+      if (e.target.dataset.td == null) return; const i = Number(e.target.dataset.td);
+      tipos[i].dias = [...hostTipos.querySelectorAll(`[data-td="${i}"]:checked`)].map((x) => Number(x.value));
+    });
+    hostTipos.addEventListener("click", (e) => { if (e.target.dataset.tdel != null) { tipos.splice(Number(e.target.dataset.tdel), 1); dibujarTipos(); } });
+    document.getElementById("pp-add-tipo").addEventListener("click", () => { tipos.push({ id: "t" + Date.now().toString(36), nombre: "Nuevo tipo de día", dias: [], comidas: [{ hora: "", titulo: "", detalle: "", p: 0, h: 0 }] }); dibujarTipos(); });
+    dibujarTipos();
+
+    const getInt = tablaEditable(document.getElementById("pp-int"),
+      [{ k: "n", label: "Alimento" }, { k: "cant", label: "1 bloque", w: "18%" }, { k: "kcal", label: "kcal", type: "num", w: "70px" }, { k: "g", label: "Grasa g", type: "num", w: "70px" },
+        { k: "uso", label: "Uso", type: "select", options: [["base", "Base"], ["oca", "Ocasional"], ["finde", "Finde, 1 vez"]], w: "120px" }],
+      (B.intercambios_proteina || []).map((x) => ({ ...x })), "alimento");
+    const getHc = tablaEditable(document.getElementById("pp-hc"),
+      [{ k: "n", label: "Alimento" }, { k: "cant", label: "1 porción", w: "24%" }, { k: "kcal", label: "kcal", type: "num", w: "70px" }],
+      (B.porciones_hidratos || []).map((x) => ({ ...x })), "alimento");
+    const getTextos = tablaEditable(document.getElementById("pp-textos"), [{ k: "t", label: "Título", w: "26%" }, { k: "d", label: "Texto" }], (B.textos || []).map((x) => ({ ...x })), "texto");
+    const getReglas = tablaEditable(document.getElementById("pp-reglas"), [{ k: "t", label: "Regla", w: "26%" }, { k: "d", label: "Explicación" }], (B.reglas || []).map((x) => ({ ...x })), "regla");
+
+    let modo = "editar";
+    document.querySelectorAll('#f-plan button[type=submit]').forEach((b) => b.addEventListener("click", () => (modo = b.dataset.modo)));
+    document.getElementById("f-plan").addEventListener("submit", async (ev) => {
+      ev.preventDefault();
+      const items = (id, clave) => val(id).split("\n").map((l) => l.trim()).filter(Boolean).map((l) => {
+        if (clave !== "o") return { n: l };
+        const [n, q] = l.split("="); return { n: n.trim(), q: numOrNull(q) ?? 1 };
+      });
+      const tiposFinal = tipos.map((t, i) => ({ id: t.id || "t" + i, nombre: t.nombre, dias: t.dias || [], comidas: getComidas[i]().map((f) => ({ ...f, p: f.p || 0, h: f.h || 0 })) }));
+      const bloques = {
+        ...B,
+        fase: val("pp-fase") || null, titulo: val("pp-titulo") || null, titulo_destacado: val("pp-dest") || null, bajada: val("pp-bajada") || null,
+        notas_metas: { kcal: val("pn-kcal"), proteina: val("pn-proteina"), hidratos: val("pn-hidratos"), grasas: val("pn-grasas") },
+        contador: { ...B.contador, metas: { p: numOrNull(val("pc-p")) || 0, h: numOrNull(val("pc-h")) || 0, o: numOrNull(val("pc-o")) || 0 },
+          botones: [{ grupo: "Proteína (1 bloque)", clave: "p", items: items("pb-p", "p") }, { grupo: "Hidratos (1 porción)", clave: "h", items: items("pb-h", "h") }, { grupo: "Grasas", clave: "o", items: items("pb-o", "o") }] },
+        nota_intercambios: val("pp-notaint") || null, intercambios_proteina: getInt(), porciones_hidratos: getHc(), textos: getTextos(), reglas: getReglas(), pie: val("pp-pie") || null,
+      };
+      const body = { cliente_id: c.id, nombre: val("pp-nombre") || "Plan", kcal_objetivo: numOrNull(val("pp-kcal_objetivo")), proteina_objetivo_g: numOrNull(val("pp-proteina_objetivo_g")),
+        carbohidratos_objetivo_g: numOrNull(val("pp-carbohidratos_objetivo_g")), grasas_objetivo_g: numOrNull(val("pp-grasas_objetivo_g")),
+        vigente_desde: val("pp-desde") || hoyISO(), vigente_hasta: val("pp-hasta") || null, tipos_dia: tiposFinal, bloques };
+      if (!body.kcal_objetivo || !body.proteina_objetivo_g) return avisar("pp-msg", "Faltan las calorías o la proteína objetivo.");
+      if (!tiposFinal.some((t) => t.comidas.length)) return avisar("pp-msg", "Cargá al menos una comida.");
+      document.querySelectorAll('#f-plan button[type=submit]').forEach((b) => (b.disabled = true));
+      try {
+        if (mio && modo === "editar") {
+          await api(`planes?id=eq.${mio.id}`, { method: "PATCH", body, prefer: "return=minimal" });
+        } else {
+          if (mio) await api(`planes?cliente_id=eq.${c.id}&activo=is.true`, { method: "PATCH", body: { activo: false, vigente_hasta: diaAnterior(body.vigente_desde) }, prefer: "return=minimal" });
+          await api("planes", { method: "POST", body: { ...body, activo: true }, prefer: "return=minimal" });
+        }
+        location.hash = "#/ficha/" + c.id;
+      } catch (e) {
+        document.querySelectorAll('#f-plan button[type=submit]').forEach((b) => (b.disabled = false));
+        avisar("pp-msg", "No se pudo guardar: " + e.message);
+      }
+    });
+  }
+
 
   render();
 })();

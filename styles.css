@@ -162,3 +162,23 @@ footer.foot{font-size:12px;color:var(--muted)}
 #logout{margin-left:auto}
 .tbl th:first-child,.tbl td:first-child{position:sticky;left:0;background:var(--surface);z-index:1}
 .tbl thead th:first-child,.tbl tr.grp-row td{background:var(--bg)}
+
+/* etapa 3: formularios del coach */
+a.btn{display:inline-block;text-decoration:none}
+.small-btn{font-size:13px;padding:7px 12px;margin-top:8px}
+.status.ok{color:var(--goodtxt);font-size:13px}
+.fgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:12px}
+.grid3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}
+@media (max-width:760px){.grid3{grid-template-columns:minmax(0,1fr)}}
+input:not([type]),input[type=date],input[type=email],select,textarea{font:inherit;font-size:15px;padding:9px 10px;border-radius:8px;border:1px solid var(--axis);background:var(--surface);color:var(--ink);width:100%;min-width:0}
+textarea{resize:vertical}
+label.f .muted{font-weight:400;font-size:12.5px}
+table.edit td{padding:4px}
+table.edit input,table.edit select{font-size:14px;padding:6px 8px}
+table.edit td:last-child{width:70px;text-align:center}
+.tipo{border:1px solid var(--ring);border-radius:10px;padding:14px;background:var(--bg);display:flex;flex-direction:column;gap:10px}
+.dias{display:flex;flex-wrap:wrap;gap:6px}
+.dia{display:inline-flex;align-items:center;gap:4px;font-size:13.5px;font-weight:400;border:1px solid var(--ring);border-radius:999px;padding:4px 10px;background:var(--surface)}
+.dia input{accent-color:var(--mus)}
+.sticky-save{position:sticky;bottom:8px;z-index:5;box-shadow:0 6px 24px rgba(0,0,0,.12)}
+.who .btn{flex:none}
