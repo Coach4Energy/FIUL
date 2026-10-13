@@ -182,3 +182,13 @@ table.edit td:last-child{width:70px;text-align:center}
 .dia input{accent-color:var(--mus)}
 .sticky-save{position:sticky;bottom:8px;z-index:5;box-shadow:0 6px 24px rgba(0,0,0,.12)}
 .who .btn{flex:none}
+
+/* pantalla de carga */
+.sk{display:flex;flex-direction:column;gap:14px}
+.sk div{background:var(--grid);border-radius:10px;animation:sk 1.2s ease-in-out infinite}
+.sk-l{height:12px}.sk-l.h{height:40px}.w30{width:30%}.w60{width:60%}
+.sk-kpis{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;background:none!important;animation:none!important}
+@media (max-width:760px){.sk-kpis{grid-template-columns:repeat(2,minmax(0,1fr))}}
+.sk-b{height:84px}.sk-card{height:180px}
+@keyframes sk{0%,100%{opacity:1}50%{opacity:.45}}
+@media (prefers-reduced-motion:reduce){.sk div{animation:none}}

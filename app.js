@@ -30,6 +30,9 @@
 
   /* ---------- sesión y API ---------- */
   let sesion = store.get(SKEY);
+  let avisoLogin = "";
+  let tmrRefresco = null;
+  const ahora = () => Date.now() / 1000;
   const conf = () => CFG.supabaseKey && !/PEGAR_ACA/.test(CFG.supabaseKey);
 
   async function authFetch(path, body) {
@@ -43,32 +46,86 @@
     return j;
   }
   function guardarSesion(j) {
-    sesion = { access_token: j.access_token, refresh_token: j.refresh_token, expires_at: Math.floor(Date.now() / 1000) + (j.expires_in || 3600), user: j.user };
+    sesion = { access_token: j.access_token, refresh_token: j.refresh_token, expires_at: Math.floor(ahora()) + (j.expires_in || 3600), user: j.user };
     store.set(SKEY, sesion);
+    programarRefresco();
   }
   async function login(email, password) {
     guardarSesion(await authFetch("/auth/v1/token?grant_type=password", { email, password }));
   }
+  // La sesión se renueva sola en segundo plano, 2 minutos antes de vencer.
+  function programarRefresco() {
+    clearTimeout(tmrRefresco);
+    if (!sesion) return;
+    const ms = (sesion.expires_at - 120 - ahora()) * 1000;
+    // Un margen al azar evita que dos pestañas renueven en el mismo instante.
+    tmrRefresco = setTimeout(() => refrescar().catch(() => {}), Math.max(ms - Math.random() * 20000, 5000));
+  }
+  // Si el refresh token ya no sirve (venció, se usó en otra pestaña o se cerró la sesión),
+  // se vuelve al login con un aviso en vez de mostrar un error.
+  function sesionVencida() {
+    clearTimeout(tmrRefresco);
+    sesion = null; store.del(SKEY); estado = {}; cache.clear();
+    avisoLogin = "Tu sesión venció. Volvé a entrar con tu email y contraseña.";
+    if (location.hash && location.hash !== "#/") location.hash = "#/"; else render();
+  }
   let refrescando = null;
   async function refrescar() {
-    if (!sesion) throw new Error("sin sesión");
-    if (!refrescando) refrescando = authFetch("/auth/v1/token?grant_type=refresh_token", { refresh_token: sesion.refresh_token })
-      .then(guardarSesion).finally(() => { refrescando = null; });
+    // Otra pestaña pudo haber renovado la sesión: se usa la guardada si es más nueva.
+    const guardada = store.get(SKEY);
+    if (guardada && sesion && guardada.refresh_token !== sesion.refresh_token && guardada.expires_at - 60 > ahora()) {
+      sesion = guardada; programarRefresco(); return;
+    }
+    if (!sesion) throw Object.assign(new Error("Sesión vencida"), { vencida: true });
+    const usado = sesion.refresh_token;
+    if (!refrescando) refrescando = authFetch("/auth/v1/token?grant_type=refresh_token", { refresh_token: usado })
+      .then(guardarSesion)
+      .catch((e) => {
+        if (e.status >= 400 && e.status < 500) {
+          // Si otra pestaña lo renovó al mismo tiempo, se adopta esa sesión en vez de cerrar.
+          const g = store.get(SKEY);
+          if (g && g.refresh_token !== usado) { sesion = g; programarRefresco(); return; }
+          sesionVencida(); throw Object.assign(new Error("Sesión vencida"), { vencida: true });
+        }
+        throw e; // sin conexión: se reintenta más tarde, sin cerrar la sesión
+      })
+      .finally(() => { refrescando = null; });
     return refrescando;
   }
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible" && sesion && sesion.expires_at - 120 < ahora()) refrescar().catch(() => {});
+  });
+  window.addEventListener("storage", (e) => {
+    if (e.key !== SKEY) return;
+    const nueva = store.get(SKEY);
+    if (!nueva && sesion) { sesion = null; estado = {}; cache.clear(); render(); return; }
+    if (nueva) { sesion = nueva; programarRefresco(); }
+  });
   async function salir() {
-    if (sesion) fetch(CFG.supabaseUrl + "/auth/v1/logout", { method: "POST", headers: { apikey: CFG.supabaseKey, Authorization: "Bearer " + sesion.access_token } }).catch(() => {});
-    sesion = null; store.del(SKEY); estado = {}; location.hash = "#/"; render();
+    // scope=local: cierra solo este dispositivo (no las sesiones abiertas en otros).
+    if (sesion) fetch(CFG.supabaseUrl + "/auth/v1/logout?scope=local", { method: "POST", headers: { apikey: CFG.supabaseKey, Authorization: "Bearer " + sesion.access_token } }).catch(() => {});
+    clearTimeout(tmrRefresco);
+    sesion = null; store.del(SKEY); estado = {}; cache.clear(); avisoLogin = "";
+    location.hash = "#/"; render();
   }
+
+  // Caché de lecturas: cambiar de sección no vuelve a pedir lo mismo durante 30 s.
+  // Cualquier escritura la vacía, para no mostrar datos viejos.
+  const cache = new Map();
+  const CACHE_MS = 30000;
   async function api(path, { method = "GET", body, prefer } = {}, reintento = true) {
-    if (!sesion) throw new Error("sin sesión");
-    if (sesion.expires_at - 60 < Date.now() / 1000) await refrescar();
+    if (!sesion) throw Object.assign(new Error("Sesión vencida"), { vencida: true });
+    if (method === "GET") {
+      const c = cache.get(path);
+      if (c && Date.now() - c.t < CACHE_MS) return JSON.parse(c.v);
+    } else cache.clear();
+    if (sesion.expires_at - 30 < ahora()) await refrescar();
     const headers = { apikey: CFG.supabaseKey, Authorization: "Bearer " + sesion.access_token };
     if (body !== undefined) headers["Content-Type"] = "application/json";
     if (prefer) headers.Prefer = prefer;
     const r = await fetch(CFG.supabaseUrl + "/rest/v1/" + path, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });
     if (r.status === 401 && reintento) {
-      try { await refrescar(); } catch (e) { salir(); throw e; }
+      await refrescar();
       return api(path, { method, body, prefer }, false);
     }
     if (!r.ok) {
@@ -77,8 +134,11 @@
     }
     if (r.status === 204) return null;
     const t = await r.text();
-    return t ? JSON.parse(t) : null;
+    const data = t ? JSON.parse(t) : null;
+    if (method === "GET") cache.set(path, { t: Date.now(), v: t || "null" });
+    return data;
   }
+  programarRefresco();
 
   /* ---------- estado ---------- */
   let estado = {}; // { esCoach, cliente, clientes, planes:{id->plan}, ... }
@@ -132,7 +192,7 @@
           const c = estado.clientes.find((x) => x.id === id);
           if (!c) { APP.innerHTML = `<p class="err">No se encontró ese cliente.</p>`; return; }
           pintarNav("ficha", id);
-          APP.innerHTML = `<p class="muted">Cargando…</p>`;
+          APP.innerHTML = esqueleto();
           if (vista === "ficha") return await vistaFicha(c);
           if (vista === "editar-ficha") return vistaFichaForm(c);
           if (vista === "medicion") return await vistaMedicionForm(c, ruta().raw[2] ? Number(ruta().raw[2]) : null);
@@ -147,11 +207,12 @@
       if (!cliente) { APP.innerHTML = `<p class="err">No se encontró ese cliente.</p>`; return; }
       const v = ["hoy", "plan", "informe"].includes(vista) ? vista : "hoy";
       pintarNav(v, estado.esCoach ? cliente.id : null);
-      APP.innerHTML = `<p class="muted">Cargando…</p>`;
+      APP.innerHTML = esqueleto();
       if (v === "hoy") return await vistaHoy(cliente);
       if (v === "plan") return await vistaPlan(cliente);
       if (v === "informe") return await vistaInforme(cliente);
     } catch (e) {
+      if (e.vencida) return; // ya se mostró el login
       console.error(e);
       APP.innerHTML = `<section class="card"><h2>No se pudo cargar</h2><p class="err">${esc(e.message)}</p><button class="btn sec" type="button" id="retry">Reintentar</button></section>`;
       document.getElementById("retry").addEventListener("click", () => location.reload());
@@ -163,6 +224,12 @@
   window.addEventListener("hashchange", render);
   document.getElementById("logout").addEventListener("click", salir);
 
+  // Pantalla de carga: bloques grises que "respiran" mientras llegan los datos.
+  function esqueleto() {
+    return `<div class="sk" role="status" aria-label="Cargando"><div class="sk-l w30"></div><div class="sk-l w60 h"></div>
+      <div class="sk-kpis"><div class="sk-b"></div><div class="sk-b"></div><div class="sk-b"></div><div class="sk-b"></div></div>
+      <div class="sk-card"></div><div class="sk-card"></div></div>`;
+  }
   function bannerCoach(cliente) {
     return estado.esCoach ? `<div class="banner"><span>Estás viendo la app de <b>${esc(cliente.nombre)}</b> como coach.</span><a href="#/coach">Volver a clientes</a></div>` : "";
   }
@@ -173,6 +240,7 @@
       <form class="form" id="f-login" novalidate>
         <div class="brand" style="font-size:44px">FI<span>Ü</span>L</div>
         <p class="lede">Tu plan, tu registro diario y tu evolución, en un solo lugar.</p>
+        ${avisoLogin ? `<p class="callout" role="status">${esc(avisoLogin)}</p>` : ""}
         <label class="f">Email<input type="email" id="l-email" autocomplete="username" required></label>
         <label class="f">Contraseña<input type="password" id="l-pass" autocomplete="current-password" required></label>
         <button class="btn" type="submit" id="l-btn">Entrar</button>
@@ -185,6 +253,7 @@
       btn.disabled = true; err.textContent = "";
       try {
         await login(document.getElementById("l-email").value.trim(), document.getElementById("l-pass").value);
+        avisoLogin = "";
         estado = {}; await render();
       } catch (e) {
         err.textContent = e.status === 400 ? "Email o contraseña incorrectos." : "No se pudo entrar: " + e.message;
@@ -472,7 +541,7 @@
 
   /* ---------- PANEL DEL COACH ---------- */
   async function vistaCoach() {
-    APP.innerHTML = `<p class="muted">Cargando clientes…</p>`;
+    APP.innerHTML = esqueleto();
     const desde = hoyISO(-13);
     const [regs, planes] = await Promise.all([
       api(`registros_diarios?select=cliente_id,fecha,bloques&fecha=gte.${desde}&order=fecha.desc`),
